@@ -208,9 +208,33 @@ def _persist_symbol_bars(symbol: str, bars: list[PriceBar]) -> None:
 
 @app.get("/")
 def read_root():
-    """Simple health/root endpoint."""
-    return {"Hello": "World"}
+    """Root endpoint that advertises the API and points to docs."""
+    return {
+        "service": "Stock Volatility API",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "endpoints": {
+            "health": "/health",
+            "prices": "/prices?symbol=MSFT&limit=200",
+        },
+    }
 
+@app.get("/health")
+def health():
+    """Health check endpoint.
+
+    Returns a small status payload indicating whether the API process is running
+    and whether local storage paths are accessible. This endpoint does not call
+    external providers (e.g., Alpha Vantage) so it is safe for frequent checks.
+    """
+    return {
+        "status": "ok",
+        "time_utc": _utc_now_iso(),
+        "repo_root": str(REPO_ROOT),
+        "data_dir": str(DATA_DIR),
+        "stock_data_dir_exists": STOCK_DATA_DIR.exists(),
+        "metadata_exists": METADATA_PATH.exists(),
+    }
 
 @app.get("/prices", response_model=list[PriceBar])
 def get_prices(symbol: str, outputsize: str = "compact", limit: int = 200):
