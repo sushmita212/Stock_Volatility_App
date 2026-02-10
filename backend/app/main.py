@@ -3,7 +3,8 @@ import os
 import json
 import csv
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -61,29 +62,22 @@ def _local_now_human() -> str:
 def _load_metadata() -> dict:
     """Load the metadata JSON file from disk.
 
-    Returns:
-        A dict shaped like:
-        {
-          "version": 1,
-          "tickers": {
-              "MSFT": {
-                  "last_date": "2026-02-09",
-                  "rows": 1234,
-                  "last_refresh_success_at": "...",
-                  "status": "ok",
-                  "source": "alphavantage"
-              },
-              ...
-          }
-        }
-
-    Behavior:
-        - If `data/metadata.json` does not exist, returns a default structure.
+    Returns default metadata if the file does not exist or is unreadable.
     """
     if not METADATA_PATH.exists():
         return {"version": 1, "tickers": {}}
-    with METADATA_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with METADATA_PATH.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return {"version": 1, "tickers": {}}
+        meta.setdefault("version", 1)
+        meta.setdefault("tickers", {})
+        if not isinstance(meta["tickers"], dict):
+            meta["tickers"] = {}
+        return meta
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "tickers": {}}
 
 
 def _save_metadata(meta: dict) -> None:
@@ -102,6 +96,129 @@ def _save_metadata(meta: dict) -> None:
         json.dump(meta, f, indent=2, sort_keys=True)
     tmp.replace(METADATA_PATH)
 
+
+def _csv_path_for_symbol(symbol: str) -> Path:
+    """Return the canonical CSV path for a ticker symbol in the local store."""
+    return STOCK_DATA_DIR / f"{symbol.upper()}.csv"
+
+
+def _read_bars_from_csv(symbol: str) -> list[PriceBar]:
+    """Read all locally stored OHLCV bars for `symbol` from CSV."""
+    csv_path = _csv_path_for_symbol(symbol)
+    if not csv_path.exists():
+        return []
+
+    bars: list[PriceBar] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            bars.append(
+                PriceBar(
+                    date=row["date"],
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    volume=float(row["volume"]),
+                )
+            )
+
+    bars.sort(key=lambda b: b.date)
+    return bars
+
+
+def _latest_local_date(symbol: str, meta: dict) -> str | None:
+    """Get the latest stored date for a symbol from metadata, falling back to CSV."""
+    sym = symbol.upper()
+    md = meta.get("tickers", {}).get(sym, {})
+    last_date = md.get("last_date")
+    if isinstance(last_date, str) and last_date:
+        return last_date
+
+    # Fallback: compute from CSV without loading everything into Pydantic models
+    csv_path = _csv_path_for_symbol(symbol)
+    if not csv_path.exists():
+        return None
+
+    max_date: str | None = None
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            d = row.get("date")
+            if d and (max_date is None or d > max_date):
+                max_date = d
+    return max_date
+
+def _expected_latest_daily_date_et(now_utc: datetime | None = None, after_close_hour_et: int = 18) -> str:
+    """Return the latest *expected* daily bar date for US markets.
+
+    We approximate that the newest fully-available daily bar is:
+    - yesterday's date (ET) before `after_close_hour_et` (default 6pm ET)
+    - today's date (ET) at/after `after_close_hour_et`
+
+    This avoids repeatedly refreshing during the trading day when providers often
+    only have data through the prior close.
+
+    Args:
+        now_utc: Current time in UTC (defaults to now).
+        after_close_hour_et: Local ET hour after which we expect today's bar.
+
+    Returns:
+        ISO date string YYYY-MM-DD in Eastern time.
+    """
+
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    expected = now_et.date()
+    if now_et.hour < after_close_hour_et:
+        expected = expected - timedelta(days=1)
+
+    return expected.isoformat()
+
+
+def _parse_utc_iso(ts: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp (possibly with Z/offset) into an aware UTC datetime."""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_stale_daily(symbol: str, meta: dict, refresh_cooldown_minutes: int = 360) -> bool:
+    """Return True if local data for `symbol` should be refreshed.
+
+    Staleness logic (v1 market-aware):
+    1) If no local data -> stale
+    2) If we refreshed successfully within `refresh_cooldown_minutes` -> not stale
+    3) Otherwise compare last stored bar date to the *expected* latest market date
+       based on ET and an after-close cutoff.
+
+    Notes:
+        - This does not account for weekends/holidays; the cooldown prevents most
+          repeated calls when the provider hasn't published a new bar yet.
+    """
+
+    sym = symbol.upper()
+    last_date = _latest_local_date(symbol, meta)
+    if not last_date:
+        return True
+
+    md = meta.get("tickers", {}).get(sym, {})
+    last_refresh = md.get("last_refresh_success_at")
+    if isinstance(last_refresh, str) and last_refresh:
+        last_refresh_dt = _parse_utc_iso(last_refresh)
+        if last_refresh_dt is not None:
+            age = datetime.now(timezone.utc) - last_refresh_dt
+            if age < timedelta(minutes=refresh_cooldown_minutes):
+                return False
+
+    expected_latest = _expected_latest_daily_date_et()
+    return last_date < expected_latest
 
 def _read_existing_rows(csv_path: Path) -> dict[str, dict]:
     """Read an existing OHLCV CSV file into a dict keyed by date.
@@ -205,6 +322,51 @@ def _persist_symbol_bars(symbol: str, bars: list[PriceBar]) -> None:
     }
     _save_metadata(meta)
 
+def _fetch_daily_from_alpha_vantage(symbol: str, outputsize: str, api_key: str) -> list[PriceBar]:
+    """Fetch daily OHLCV from Alpha Vantage and normalize it into `PriceBar` objects."""
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "TIME_SERIES_DAILY",
+        "symbol": symbol,
+        "outputsize": outputsize,  # "compact" or "full"
+        "datatype": "json",
+        "apikey": api_key,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    # If AV returns non-JSON, this will raise; we keep it explicit:
+    try:
+        data = r.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail=f"Alpha Vantage returned non-JSON (status {r.status_code}).")
+
+    # Alpha Vantage sends errors as JSON with HTTP 200
+    if "Note" in data:
+        raise HTTPException(status_code=429, detail=f"Alpha Vantage rate limit: {data['Note']}")
+    if "Information" in data:
+        raise HTTPException(status_code=403, detail=f"Alpha Vantage info: {data['Information']}")
+    if "Error Message" in data:
+        raise HTTPException(status_code=400, detail=f"Alpha Vantage error: {data['Error Message']}")
+
+    ts_key = "Time Series (Daily)"
+    if ts_key not in data:
+        raise HTTPException(status_code=502, detail=f"Unexpected Alpha Vantage response keys: {list(data.keys())}")
+    ts = data[ts_key]
+
+    out: list[PriceBar] = []
+    for d in sorted(ts.keys()):
+        row = ts[d]
+        out.append(
+            PriceBar(
+                date=d,
+                open=float(row["1. open"]),
+                high=float(row["2. high"]),
+                low=float(row["3. low"]),
+                close=float(row["4. close"]),
+                volume=float(row["5. volume"]),
+            )
+        )
+
+    return out
 
 @app.get("/")
 def read_root():
@@ -238,74 +400,42 @@ def health():
 
 @app.get("/prices", response_model=list[PriceBar])
 def get_prices(symbol: str, outputsize: str = "compact", limit: int = 200):
-    """Fetch daily OHLCV from Alpha Vantage, persist it locally, and return a tail.
+    """Return daily OHLCV for `symbol` with lazy refresh.
 
-    Args:
-        symbol: Ticker symbol (e.g., "MSFT").
-        outputsize: Alpha Vantage output size ("compact" or "full").
-        limit: Maximum number of most-recent bars to return (rows). This does not
-            limit what is fetched from Alpha Vantage; it only limits the response.
+    Strategy:
+        - Serve from local CSV if data is fresh.
+        - Refresh from Alpha Vantage only when stale/missing.
+        - Always return only the most recent `limit` bars.
 
-    Returns:
-        A list of `PriceBar` objects sorted oldest -> newest, limited to the most
-        recent `limit` bars.
-
-    Raises:
-        HTTPException:
-            - 400 if `limit` is invalid.
-            - 500 if AV_API_KEY is missing.
-            - 429 if Alpha Vantage rate limit is hit.
-            - 400 for Alpha Vantage API errors (invalid symbol/params).
-            - 502 for unexpected upstream response format.
+    Freshness rule (v1):
+        Refresh if metadata last_date (or CSV max date) is < today's UTC date.
     """
     if limit < 1:
         raise HTTPException(status_code=400, detail="limit must be >= 1")
     if limit > 5000:
         raise HTTPException(status_code=400, detail="limit too large (max 5000)")
+    meta = _load_metadata()
+
+    # If local is fresh, serve from disk without hitting Alpha Vantage
+    if not _is_stale_daily(symbol, meta):
+        local_bars = _read_bars_from_csv(symbol)
+        if local_bars:
+            return local_bars[-limit:]
+        # If metadata says fresh but file missing/empty, treat as stale
+        # (falls through to fetch)
 
     api_key = os.getenv("AV_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing AV_API_KEY environment variable.")
 
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "TIME_SERIES_DAILY",
-        "symbol": symbol,
-        "outputsize": outputsize,  # "compact" or "full"
-        "datatype": "json",
-        "apikey": api_key,
-    }
+    fetched = _fetch_daily_from_alpha_vantage(symbol, outputsize=outputsize, api_key=api_key)
 
-    r = requests.get(url, params=params, timeout=30)
-    data = r.json()
+    # Persist fetched set, then serve from local store (ensures consistency with merge/dedupe)
+    _persist_symbol_bars(symbol, fetched)
 
-    # Alpha Vantage sends errors as JSON with HTTP 200
-    if "Note" in data:
-        raise HTTPException(status_code=429, detail=f"Alpha Vantage rate limit: {data['Note']}")
-    if "Error Message" in data:
-        raise HTTPException(status_code=400, detail=f"Alpha Vantage error: {data['Error Message']}")
+    local_bars = _read_bars_from_csv(symbol)
+    if local_bars:
+        return local_bars[-limit:]
 
-    ts_key = "Time Series (Daily)"
-    if ts_key not in data:
-        raise HTTPException(status_code=502, detail=f"Unexpected Alpha Vantage response keys: {list(data.keys())}")
-
-    ts = data[ts_key]
-
-    out: list[PriceBar] = []
-    for d in sorted(ts.keys()):
-        row = ts[d]
-        out.append(
-            PriceBar(
-                date=d,
-                open=float(row["1. open"]),
-                high=float(row["2. high"]),
-                low=float(row["3. low"]),
-                close=float(row["4. close"]),
-                volume=float(row["5. volume"]),
-            )
-        )
-
-    # Persist full fetched set (compact/full), then return tail(limit)
-    _persist_symbol_bars(symbol, out)
-
-    return out[-limit:]
+    # Should not happen, but keep a clear error if persistence failed silently
+    return fetched[-limit:]
