@@ -7,8 +7,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from backend.app.datalayer.alphavantage import ProviderError, fetch_time_series_daily, normalize_daily_ohlcv
-from backend.app.datalayer.storage import StorePaths, load_metadata, read_bars_tail, persist_symbol_rows
+from backend.app.datalayer.storage import StorePaths, load_metadata, read_bars_tail, persist_symbol_rows, csv_path_for_symbol
 from backend.app.datalayer.refresh_policy import is_stale_daily
+from backend.app.services.refresh_service import run_integrity_refresh
 
 load_dotenv()
 app = FastAPI()
@@ -87,8 +88,15 @@ def get_prices(symbol: str, outputsize: str = "compact", limit: int = 200):
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing AV_API_KEY environment variable.")
 
+    # First-time fetch: if we have no local CSV yet, pull full history once.
+    # Otherwise default to compact to minimize provider calls/bytes.
+    effective_outputsize = outputsize
+    if outputsize == "compact":
+        if not csv_path_for_symbol(STORE_PATHS, symbol).exists():
+            effective_outputsize = "full"
+
     try:
-        ts = fetch_time_series_daily(symbol=symbol, api_key=api_key, outputsize=outputsize)
+        ts = fetch_time_series_daily(symbol=symbol, api_key=api_key, outputsize=effective_outputsize)
         rows = normalize_daily_ohlcv(ts)
         persist_symbol_rows(STORE_PATHS, symbol=symbol, new_rows=rows, source="alphavantage")
     except ProviderError as e:
@@ -120,3 +128,16 @@ def get_prices(symbol: str, outputsize: str = "compact", limit: int = 200):
         )
         for r in rows[-limit:]
     ]
+
+
+@app.post("/refresh/integrity")
+def refresh_integrity(every_days: int = 80):
+    """Trigger a compact integrity refresh for all known symbols.
+
+    Scheduling should be done externally (cron/GitHub Actions/etc). This endpoint
+    is mainly for manual testing.
+    """
+    try:
+        return run_integrity_refresh(every_days=every_days)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
