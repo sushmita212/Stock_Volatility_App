@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -76,6 +77,13 @@ def run_integrity_refresh(every_days: int = 80) -> dict:
     if not api_key:
         raise RuntimeError("Missing AV_API_KEY environment variable.")
 
+    # Alpha Vantage free tier is sensitive to request bursts.
+    # Default: one request ~every 12 seconds (5 requests/min).
+    try:
+        sleep_seconds = float(os.getenv("AV_SLEEP_SECONDS", "12"))
+    except ValueError:
+        sleep_seconds = 12.0
+
     paths = StorePaths(repo_root=_repo_root())
     meta = load_metadata(paths)
 
@@ -83,7 +91,8 @@ def run_integrity_refresh(every_days: int = 80) -> dict:
     skipped: list[str] = []
     errors: dict[str, str] = {}
 
-    for sym in symbols_from_store(paths):
+    symbols = symbols_from_store(paths)
+    for i, sym in enumerate(symbols):
         if not should_compact_integrity_refresh(sym, meta, every_days=every_days):
             skipped.append(sym)
             continue
@@ -96,9 +105,14 @@ def run_integrity_refresh(every_days: int = 80) -> dict:
         except Exception as e:  # pragma: no cover
             errors[sym] = f"{type(e).__name__}: {e}"
 
+        # Stagger requests to avoid burst limits.
+        if sleep_seconds > 0 and i < (len(symbols) - 1):
+            time.sleep(sleep_seconds)
+
     return {
         "time_utc": datetime.now(timezone.utc).isoformat(),
         "every_days": every_days,
+        "sleep_seconds": sleep_seconds,
         "refreshed": refreshed,
         "skipped": skipped,
         "errors": errors,
