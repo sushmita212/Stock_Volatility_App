@@ -88,15 +88,8 @@ def get_prices(symbol: str, outputsize: str = "compact", limit: int = 200):
     if not api_key:
         raise HTTPException(status_code=500, detail="Missing AV_API_KEY environment variable.")
 
-    # First-time fetch: if we have no local CSV yet, pull full history once.
-    # Otherwise default to compact to minimize provider calls/bytes.
-    effective_outputsize = outputsize
-    if outputsize == "compact":
-        if not csv_path_for_symbol(STORE_PATHS, symbol).exists():
-            effective_outputsize = "full"
-
     try:
-        ts = fetch_time_series_daily(symbol=symbol, api_key=api_key, outputsize=effective_outputsize)
+        ts = fetch_time_series_daily(symbol=symbol, api_key=api_key, outputsize=outputsize)
         rows = normalize_daily_ohlcv(ts)
         persist_symbol_rows(STORE_PATHS, symbol=symbol, new_rows=rows, source="alphavantage")
     except ProviderError as e:
