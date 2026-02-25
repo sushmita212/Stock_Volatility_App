@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.stockvol.integrityrefresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/susmitasingh/Documents/GitHub/Stock_Volatility_App/scripts/integrity_refresh.sh</string>
+    </array>
+
+    <!-- Run daily at 11:00 local time -->
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Hour</key><integer>11</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <!-- Also run once when loaded (useful for testing) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/susmitasingh/Documents/GitHub/Stock_Volatility_App/logs/launchd_integrity_refresh.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/susmitasingh/Documents/GitHub/Stock_Volatility_App/logs/launchd_integrity_refresh.err</string>
+  </dict>
+</plist>
